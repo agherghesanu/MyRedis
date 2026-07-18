@@ -1,122 +1,116 @@
 #include <iostream>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <vector>
+#include <string>
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 #include <unistd.h>
-#include <cstring>
-#include <cassert>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/ip.h>
 
 using namespace std;
 
-const size_t k_max_msg = 4096;
-
 static void die(const char* msg) {
-	perror(msg);
-	exit(EXIT_FAILURE);
+    perror(msg);
+    abort();
 }
 
 static int32_t read_full(int fd, char* buf, size_t n) {
-	while (n > 0) {
-		ssize_t rv = read(fd, buf, n);
-		if (rv <= 0) {
-			return -1;
-		}
-		assert((size_t)rv <= n);
-		n -= (size_t)rv;
-		buf += rv;
-	}
-	return 0;
+    while (n > 0) {
+        ssize_t rv = read(fd, buf, n);
+        if (rv <= 0) return -1;
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
 }
 
 static int32_t write_all(int fd, const char* buf, size_t n) {
-	while (n > 0) {
-		ssize_t rv = write(fd, buf, n);
-		if (rv <= 0) {
-			return -1;
-		}
-		assert((size_t)rv <= n);
-		n -= (size_t)rv;
-		buf += rv;
-	}
-	return 0;
+    while (n > 0) {
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0) return -1;
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
 }
 
-static int32_t query(int fd, const char* text) {
-	uint32_t len = strlen(text);
-	if (len > k_max_msg) {
-		return -1;
-	}
+// serializes a multi-argument vector list command down into raw network protocol bytes
+static int32_t send_req(int fd, const vector<string>& cmd) {
+    uint32_t len = 4;
+    for (const string& s : cmd) {
+        len += 4 + s.size();
+    }
 
-	char wbuf[4 + k_max_msg];
-	memcpy(wbuf, &len, 4);
-	memcpy(wbuf + 4, text, len);
+    vector<char> wbuf(4 + len);
+    memcpy(&wbuf[0], &len, 4);
 
-	int32_t err = write_all(fd, wbuf, 4 + len);
+    uint32_t n = (uint32_t)cmd.size();
+    memcpy(&wbuf[4], &n, 4);
 
-	if (err) {
-		return err;
-	}
+    size_t cur = 8;
+    for (const string& s : cmd) {
+        uint32_t p = (uint32_t)s.size();
+        memcpy(&wbuf[cur], &p, 4);
+        memcpy(&wbuf[cur + 4], s.data(), s.size());
+        cur += 4 + s.size();
+    }
+    return write_all(fd, wbuf.data(), wbuf.size());
+}
 
-	char rbuf[4 + k_max_msg];
-	err = read_full(fd, rbuf, 4);
+static int32_t read_res(int fd) {
+    char rbuf[4 + 4096];
+    if (read_full(fd, rbuf, 4) < 0) return -1;
 
-	if (err) {
-		cerr << "read header error" << endl; 
-	}
+    uint32_t len = 0;
+    memcpy(&len, rbuf, 4);
+    if (len > 4096) return -1;
 
-	memcpy(&len, rbuf, 4);
+    if (read_full(fd, &rbuf[4], len) < 0) return -1;
 
-	if (len > k_max_msg) {
-		cerr << "msg too long" << endl;
-		return - 1;
-	}
+    const uint8_t* cur = (const uint8_t*)&rbuf[4];
+    const uint8_t* end = cur + len;
 
-	err = read_full(fd, rbuf + 4, len);
-	if (err) {
-		cerr << "read body error" << endl;
-		return err;
-	}
+    uint32_t nstr = 0;
+    memcpy(&nstr, cur, 4); cur += 4;
 
-	cout << "server says" << string(rbuf + 4, len) << endl;
-	return 0;
+    cout << "Response (" << nstr << " strings): ";
+    for (uint32_t i = 0; i < nstr; i++) {
+        uint32_t slen = 0;
+        memcpy(&slen, cur, 4); cur += 4;
+        cout << string((const char*)cur, slen) << " ";
+        cur += slen;
+    }
+    cout << endl;
+    return 0;
 }
 
 int main() {
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) {
-		die("socket");
-	}
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) die("socket()");
 
-	struct sockaddr_in addr = {};
-	addr.sin_family = AF_INET;
-	addr.sin_port = ntohs(1234);
-	addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK);
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(1234);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-	int rv = connect(fd, (const struct sockaddr*)&addr, sizeof(addr));
-	if (rv) {
-		die("connect");
-	}
+    if (connect(fd, (const sockaddr*)&addr, sizeof(addr)) < 0) die("connect");
 
-	int32_t err = query(fd, "hello1");
-	if (err) {
-		close(fd);
-		return 0;
-	}
+    // Blast multiple pipelined commands concurrently without waiting for sequential blocking answers
+    cout << "Blasting 3 pipelined commands..." << endl;
+    send_req(fd, { "set", "user", "alex" });
+    send_req(fd, { "get", "user" });
+    send_req(fd, { "del", "user" });
 
-	err = query(fd, "hello2");
-	if (err) {
-		close(fd);
-		return 0;
-	}
+    // Consume and parse responses back off the network sequence queue
+    cout << "Reading replies..." << endl;
+    read_res(fd);
+    read_res(fd);
+    read_res(fd);
 
-	err = query(fd, "hello3");
-	if (err) {
-		close(fd);
-		return 0;
-	}
-
-
-
-
-
-	
+    close(fd);
+    return 0;
 }

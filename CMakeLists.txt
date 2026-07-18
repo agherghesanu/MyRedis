@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Add Server Executable
-add_executable(redis_server src/server.cpp)
+add_executable(redis_server src/server.cpp src/conn.h)
 
 # Add Client Executable
-add_executable(redis_client src/client.cpp)
+add_executable(redis_client src/client.cpp src/conn.h)
