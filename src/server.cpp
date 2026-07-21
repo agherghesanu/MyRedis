@@ -1,41 +1,76 @@
-#include <iostream>
-#include <vector>
-#include <string>
+// stdlib
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <iostream>
+
+// system
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+
+// C++
+#include <string>
+#include <vector>
+#include <map>
 #include "conn.h"
 
 using namespace std;
 
-const size_t k_max_msg = 4096;
+const size_t k_max_msg = 32 << 20; // 32mb buffer
+
+const size_t k_max_args = 200 * 1000;
+
+enum {
+	RES_OK = 0,
+	RES_ERR = 1,    // error
+	RES_NX = 2,     // key not found
+};
+
+struct Response {
+	uint32_t status = 0;
+	vector<uint8_t> data;
+};
+
+// Placeholder in-memory database map
+static map<string, string> g_data;
 
 
 
-//print error message
+static void msg(const char* msg) {
+	fprintf(stderr, "%s\n", msg);// sderr prints directly to terminal no buffer
+	//better practice for concurrent code
+}
+
+static void msg_errno(const char* msg) {
+	fprintf(stderr, "[errno:%d] %s\n", errno, msg);
+}
+
 static void die(const char* msg) {
-	perror(msg);
+	fprintf(stderr, "[%d] %s\n", errno, msg);
 	abort();
 }
 
 // sets up non blocking file descriptor
 static void fd_set_nb(int fd) {
-	int flags = fcntl(fd, F_GETFL, 0);
-	if (flags < 0) {
+	errno = 0; // more robust error handling 
+	//reversion to 0 needed bc errno doesnt reset on success
+	int flags = fcntl(fd, F_GETFL, 0); // get flags
+	if (errno) {
 		die("fcntl error");
+		return;
 	}
-	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) < 0) {
-		die("fcnt error");
+	flags |= O_NONBLOCK; // append non blocking flags
+	errno = 0;
+	(void)fcntl(fd, F_SETFL, flags); //syscall to set flags
+	if (errno) {
+		die("fcntl error");
 	}
 }
 
@@ -47,6 +82,30 @@ static void buf_append(Buffer& buf, const uint8_t* data, size_t len) {
 //consume data from the front of the vector stream
 static void buf_consume(Buffer& buf, size_t len) {
 	buf.erase(buf.begin(), buf.begin() + len);
+}
+
+
+// helper for acception connections from clients
+static Conn* handle_accept(int fd) {
+	struct sockaddr_in client_addr = {};
+	socklen_t addrlen = sizeof(client_addr);
+	int connfd = accept(fd, (struct sockaddr*)&client_addr, &addrlen);
+	if (connfd < 0) {
+		msg_errno("accept() error");
+		return NULL;
+	}
+	uint32_t ip = client_addr.sin_addr.s_addr;
+	fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
+		ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+		ntohs(client_addr.sin_port)
+	);
+
+	fd_set_nb(connfd);
+
+	Conn* conn = new Conn();
+	conn->fd = connfd;
+	conn->want_read = true;
+	return conn;
 }
 
 //helper to parse strings out of our procol message list
@@ -70,12 +129,15 @@ static bool read_str(const uint8_t*& cur, const uint8_t* end, size_t n, string& 
 	return true;
 }
 
-//splits the lengtrh preixed protocl packed down into components
+// parses command arguments: [nstr][len1][str1][len2][str2]...
 static int32_t parse_req(const uint8_t* data, size_t size, vector<string>& out) {
 	const uint8_t* end = data + size;
 	uint32_t nstr = 0;
 	if (!read_u32(data, end, nstr)) {
 		return -1;
+	}
+	if (nstr > k_max_args) {
+		return -1;  // safety limit
 	}
 	while (out.size() < nstr) {
 		uint32_t len = 0;
@@ -88,55 +150,94 @@ static int32_t parse_req(const uint8_t* data, size_t size, vector<string>& out) 
 		}
 	}
 	if (data != end) {
-		return -1;
+		return -1;  // trailing garbage
 	}
 	return 0;
 }
 
-static bool try_one_request(Conn* conn) {
-	//4 bytes for length header precond
-	if (conn->incoming.size() < 4) {
-		return false;
+// executes a parsed command against the in-memory store
+// cmd holds the tokens: e.g. {"set", "name", "alex"}
+// out is filled with the status code and any returned data
+static void do_request(vector<string>& cmd, Response& out) {
+	// GET key return val or resnx if not here
+	if (cmd.size() == 2 && cmd[0] == "get") {
+		auto it = g_data.find(cmd[1]);
+		if (it == g_data.end()) {
+			out.status = RES_NX;    // key not found
+			return;
+		}
+		const std::string& val = it->second;
+		// copy the stored string into the response payload byte-for-byte
+		out.data.assign(val.begin(), val.end());
 	}
+	// SET key value -> store the valuestatus stays RES_OK by default
+	else if (cmd.size() == 3 && cmd[0] == "set") {
+		// swap steals cmd[2]'s buffer instead of copying it
+		g_data[cmd[1]].swap(cmd[2]);
+	}
+	// DEL key remove the key erase is noop if not there
+	else if (cmd.size() == 2 && cmd[0] == "del") {
+		g_data.erase(cmd[1]);
+	}
+	// unknown command or wrong argument count
+	else {
+		out.status = RES_ERR;
+	}
+}
 
-	// read length 
+// serializes a Response into the wire format: [total_len][status][data...]
+// total_len covers the 4-byte status plus the data, so the client knows
+// how many bytes to read for the whole reply
+static void make_response(const Response& resp, std::vector<uint8_t>& out) {
+	uint32_t resp_len = 4 + (uint32_t)resp.data.size();     // 4 = size of status field
+	buf_append(out, (const uint8_t*)&resp_len, 4);          // length prefix
+	buf_append(out, (const uint8_t*)&resp.status, 4);       // status code
+	buf_append(out, resp.data.data(), resp.data.size());    // payload
+}
+
+// tries to pull ONE complete message out of the incoming buffer and handle it
+// returns true if a message was processed (caller loops to drain more),
+// false if we need to wait for more bytes or are closing the connection
+static bool try_one_request(Conn* conn) {
+	// need at least the 4-byte length header before we can do anything
+	if (conn->incoming.size() < 4) {
+		return false;   // want read header
+	}
+	// read the  length from the front of the buffer
 	uint32_t len = 0;
 	memcpy(&len, conn->incoming.data(), 4);
 	if (len > k_max_msg) {
-		cout << "message too long";
-		conn->want_close = true;
+		msg("too long");
+		conn->want_close = true;    // protocol violation, drop the client
 		return false;
 	}
-
-	//check if full message arrived
+	// the full body hasn't arrived yet, wait for the next read
 	if (4 + len > conn->incoming.size()) {
-		return false;
+		return false;   // want read body
 	}
-
-
-	//point aftert length header and parse into cmd
+	// point past the length header to the actual request bytes
 	const uint8_t* request = &conn->incoming[4];
-	vector<string> cmd;
+
+	// split the raw bytes into command tokens
+	std::vector<std::string> cmd;
 	if (parse_req(request, len, cmd) < 0) {
-		conn->want_close = true;
+		msg("bad request");
+		conn->want_close = true;    // malformed frame, drop the client
 		return false;
 	}
 
+	// run the command and append its serialized reply to the outgoing buffer
+	Response resp;
+	do_request(cmd, resp);
+	make_response(resp, conn->outgoing);
 
-	cout << "client executed query with string ";
-	for (auto& s : cmd) {
-		cout << s << " ";
-	}
-	cout << endl;
-
-	//echo the message back
-	buf_append(conn->outgoing, (const uint8_t*)&len, 4);
-	buf_append(conn->outgoing, request, len);
-
-	//remove from input buffer
+	// discard the message we just consumed (header + body) from the input buffer
 	buf_consume(conn->incoming, 4 + len);
 	return true;
 }
+
+
+
 
 static void handle_write(Conn* conn) {
 	assert(conn->outgoing.size() > 0);
@@ -168,11 +269,18 @@ static void handle_read(Conn* conn) {
 		return;  // os buffer drained, nothing left to read right now
 	}
 	if (rv < 0) {
-		conn->want_close = true;  // real read error
+		msg_errno("read() error");
+		conn->want_close = true;
 		return;
 	}
 	if (rv == 0) {
-		conn->want_close = true;  // eof probs or closed connection
+		if (conn->incoming.size() == 0) {
+			msg("client closed");
+		}
+		else {
+			msg("unexpected EOF");
+		}
+		conn->want_close = true;
 		return;
 	}
 
@@ -282,6 +390,8 @@ static void handle_read(Conn* conn) {
 //	write(connfd, reply, strlen(reply));//send
 //}
 
+
+
 int main() {
 	
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -341,43 +451,39 @@ int main() {
 		}
 
 		// accept new connections on the listener
-		if (poll_args[0].revents & POLLIN) {
-			struct sockaddr_in client_addr = {};
-			socklen_t addrlen = sizeof(client_addr);
-			int connfd = accept(fd, (struct sockaddr*)&client_addr, &addrlen);
-			if (connfd >= 0) {
-				fd_set_nb(connfd);
-
-				Conn* conn = new Conn();
-				conn->fd = connfd;
-				conn->want_read = true;
-
+		// if revents is non zero that means 
+		// that the kernel changed it after poll
+		// clients are waiting
+		if (poll_args[0].revents) {
+			if (Conn* conn = handle_accept(fd)) {
 				if (fd2conn.size() <= (size_t)conn->fd) {
-					fd2conn.resize(conn->fd + 1, nullptr);
+					fd2conn.resize(conn->fd + 1);
 				}
+				assert(!fd2conn[conn->fd]);
 				fd2conn[conn->fd] = conn;
-
-				cout << "Accepted connection at fd: " << connfd << endl;
 			}
 		}
 
 		//service every ready connection
 		for (size_t i = 1; i < poll_args.size(); ++i) {
 			uint32_t ready = poll_args[i].revents;
+			//no io activity
+			//no flag set by the kernel
 			if (ready == 0) {
 				continue;
 			}
-
 			Conn* conn = fd2conn[poll_args[i].fd];
-
-			if (ready & POLLIN)  handle_read(conn);
-			if (ready & POLLOUT) handle_write(conn);
-
-			// close on error or request
+			if (ready & POLLIN) {
+				assert(conn->want_read);
+				handle_read(conn);
+			}
+			if (ready & POLLOUT) {
+				assert(conn->want_write);
+				handle_write(conn);
+			}
 			if ((ready & POLLERR) || conn->want_close) {
-				cout << "Closing connection at fd: " << conn->fd << endl;
-				close(conn->fd);
-				fd2conn[conn->fd] = nullptr;
+				(void)close(conn->fd);
+				fd2conn[conn->fd] = NULL;
 				delete conn;
 			}
 		}

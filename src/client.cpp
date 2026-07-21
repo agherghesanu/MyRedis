@@ -1,23 +1,30 @@
-#include <iostream>
-#include <vector>
-#include <string>
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <string>
+#include <vector>
+#include <iostream>
 
 using namespace std;
 
+static void msg(const char* msg) {
+    fprintf(stderr, "%s\n", msg);
+}
+
 static void die(const char* msg) {
-    perror(msg);
+    int err = errno;
+    fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
 }
 
+//send the data. if kernel buffer is full try until all data is sent
 static int32_t read_full(int fd, char* buf, size_t n) {
     while (n > 0) {
         ssize_t rv = read(fd, buf, n);
@@ -28,6 +35,7 @@ static int32_t read_full(int fd, char* buf, size_t n) {
     return 0;
 }
 
+//write data if kernel buffer full resend
 static int32_t write_all(int fd, const char* buf, size_t n) {
     while (n > 0) {
         ssize_t rv = write(fd, buf, n);
@@ -43,6 +51,10 @@ static int32_t send_req(int fd, const vector<string>& cmd) {
     uint32_t len = 4;
     for (const string& s : cmd) {
         len += 4 + s.size();
+    }
+
+    if (len > 4096) {
+        return -1;
     }
 
     vector<char> wbuf(4 + len);
@@ -63,54 +75,71 @@ static int32_t send_req(int fd, const vector<string>& cmd) {
 
 static int32_t read_res(int fd) {
     char rbuf[4 + 4096];
-    if (read_full(fd, rbuf, 4) < 0) return -1;
-
+    errno = 0;
+    int32_t err = read_full(fd, rbuf, 4);
+    if (err) {
+        if (errno == 0) {
+            msg("EOF");
+        }
+        else {
+            msg("read() error");
+        }
+        return err;
+    }
     uint32_t len = 0;
     memcpy(&len, rbuf, 4);
-    if (len > 4096) return -1;
-
-    if (read_full(fd, &rbuf[4], len) < 0) return -1;
-
-    const uint8_t* cur = (const uint8_t*)&rbuf[4];
-    const uint8_t* end = cur + len;
-
-    uint32_t nstr = 0;
-    memcpy(&nstr, cur, 4); cur += 4;
-
-    cout << "Response (" << nstr << " strings): ";
-    for (uint32_t i = 0; i < nstr; i++) {
-        uint32_t slen = 0;
-        memcpy(&slen, cur, 4); cur += 4;
-        cout << string((const char*)cur, slen) << " ";
-        cur += slen;
+    if (len > 4096) {
+        msg("too long");
+        return -1;
     }
-    cout << endl;
+
+    err = read_full(fd, &rbuf[4], len);
+    if (err) {
+        msg("read() error");
+        return err;
+    }
+
+    uint32_t rescode = 0;
+    if (len < 4) {
+        msg("bad response");
+        return -1;
+    }
+    memcpy(&rescode, &rbuf[4], 4);
+    printf("server says: status=[%u] body=%.*s\n", rescode, len - 4, &rbuf[8]);
     return 0;
 }
 
-int main() {
+int main(int argc, char** argv) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) die("socket()");
-
+    if (fd < 0) {
+        die("socket()");
+    }
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(1234);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    int rv = connect(fd, (const struct sockaddr*)&addr, sizeof(addr));
+    if (rv) {
+        die("connect");
+    }
 
-    if (connect(fd, (const sockaddr*)&addr, sizeof(addr)) < 0) die("connect");
+    std::vector<std::string> cmd;
+    for (int i = 1; i < argc; ++i) {
+        cmd.push_back(argv[i]);
+    }
 
-    // Blast multiple pipelined commands concurrently without waiting for sequential blocking answers
-    cout << "Blasting 3 pipelined commands..." << endl;
-    send_req(fd, { "set", "user", "alex" });
-    send_req(fd, { "get", "user" });
-    send_req(fd, { "del", "user" });
+    if (cmd.empty()) {
+        cmd = { "get", "k" }; // default test
+    }
 
-    // Consume and parse responses back off the network sequence queue
-    cout << "Reading replies..." << endl;
-    read_res(fd);
-    read_res(fd);
-    read_res(fd);
+    int32_t err = send_req(fd, cmd);
+    if (err) {
+        close(fd);
+    }
+    err = read_res(fd);
+    if (err) {
+        close(fd);
+    }
 
-    close(fd);
-    return 0;
+
 }
