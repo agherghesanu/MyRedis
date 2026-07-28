@@ -127,16 +127,65 @@ static int32_t parse_req(const uint8_t* data, size_t size, vector<string>& out) 
     return 0;
 }
 
+// every value in a reply is one tag byte then a type specific payload
+// nested arrays let one reply carry structured data, not just a flat blob
 enum {
-    RES_OK = 0,
-    RES_ERR = 1,
-    RES_NX = 2,
+    TAG_NIL = 0,   // nothing, like a missing key
+    TAG_ERR = 1,   // error code + message
+    TAG_STR = 2,   // string, length prefixed
+    TAG_INT = 3,   // signed 64 bit int
+    TAG_DBL = 4,   // 64 bit double
+    TAG_ARR = 5,   // n elements, each a tagged value of its own
 };
 
-struct Response {
-    uint32_t status = 0;
-    vector<uint8_t> data;
+// error codes carried by a TAG_ERR value
+enum {
+    ERR_UNKNOWN = 1,   // command not recognised
+    ERR_TOO_BIG = 2,   // reply outgrew k_max_msg
 };
+
+// fixed width appenders, little endian to match the reader on the other side
+static void buf_append_u8(vector<uint8_t>& buf, uint8_t data) {
+    buf.push_back(data);
+}
+static void buf_append_u32(vector<uint8_t>& buf, uint32_t data) {
+    buf_append(buf, (const uint8_t*)&data, 4);
+}
+static void buf_append_i64(vector<uint8_t>& buf, int64_t data) {
+    buf_append(buf, (const uint8_t*)&data, 8);
+}
+static void buf_append_dbl(vector<uint8_t>& buf, double data) {
+    buf_append(buf, (const uint8_t*)&data, 8);
+}
+
+// one out_* per tag, each writes a complete self describing value
+static void out_nil(vector<uint8_t>& out) {
+    buf_append_u8(out, TAG_NIL);
+}
+static void out_str(vector<uint8_t>& out, const char* s, size_t size) {
+    buf_append_u8(out, TAG_STR);
+    buf_append_u32(out, (uint32_t)size);
+    buf_append(out, (const uint8_t*)s, size);
+}
+static void out_int(vector<uint8_t>& out, int64_t val) {
+    buf_append_u8(out, TAG_INT);
+    buf_append_i64(out, val);
+}
+static void out_dbl(vector<uint8_t>& out, double val) {
+    buf_append_u8(out, TAG_DBL);
+    buf_append_dbl(out, val);
+}
+static void out_err(vector<uint8_t>& out, uint32_t code, const string& msg) {
+    buf_append_u8(out, TAG_ERR);
+    buf_append_u32(out, code);
+    buf_append_u32(out, (uint32_t)msg.size());
+    buf_append(out, (const uint8_t*)msg.data(), msg.size());
+}
+// only writes the header, caller must emit exactly n values after this
+static void out_arr(vector<uint8_t>& out, uint32_t n) {
+    buf_append_u8(out, TAG_ARR);
+    buf_append_u32(out, n);
+}
 
 
 static struct {
@@ -164,26 +213,23 @@ static uint64_t str_hash(const uint8_t* data, size_t len) {
     return h;
 }
 
-// looks up cmd[1], writes the value into out or sets RES_NX
+// looks up cmd[1], emits the value as a string or nil when absent
 // probe is a stack Entry, never inserted, caller must fill hcode itself
-static void do_get(vector<string>& cmd, Response& out) {
+static void do_get(vector<string>& cmd, vector<uint8_t>& out) {
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
 
     HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-    if (!node) {
-        out.status = RES_NX;
-        return;
-    }
+    if (!node) return out_nil(out);
 
     const string& val = container_of(node, Entry, node)->val;
-    out.data.assign(val.begin(), val.end());
+    return out_str(out, val.data(), val.size());
 }
 
 // overwrites cmd[1] in place if present, otherwise heap allocates and inserts
-// response is unnamed since set reports nothing back
-static void do_set(vector<string>& cmd, Response&) {
+// replies nil either way, set only cares about success not old value
+static void do_set(vector<string>& cmd, vector<uint8_t>& out) {
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
@@ -199,11 +245,12 @@ static void do_set(vector<string>& cmd, Response&) {
         ent->val.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
+    return out_nil(out);
 }
 
 // unlinks cmd[1] and frees the owning Entry, table only unlinks
-// response is unnamed since del reports nothing back, missing key is not an error
-static void do_del(vector<string>& cmd, Response&) {
+// replies 1 if a key was removed, 0 if it was already absent
+static void do_del(vector<string>& cmd, vector<uint8_t>& out) {
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
@@ -212,10 +259,24 @@ static void do_del(vector<string>& cmd, Response&) {
     if (node) {
         delete container_of(node, Entry, node);
     }
+    return out_int(out, node ? 1 : 0);
 }
 
-// dispatches on cmd[0] and arity, RES_ERR for anything unrecognised
-static void do_request(vector<string>& cmd, Response& out) {
+// per node callback, appends one key string to the array being built in arg
+static void cb_keys(HNode* node, void* arg) {
+    vector<uint8_t>& out = *(vector<uint8_t>*)arg;
+    const string& key = container_of(node, Entry, node)->key;
+    out_str(out, key.data(), key.size());
+}
+
+// dumps every key as a string array, header count comes from hm_size up front
+static void do_keys(vector<string>&, vector<uint8_t>& out) {
+    out_arr(out, (uint32_t)hm_size(&g_data.db));
+    hm_foreach(&g_data.db, &cb_keys, (void*)&out);
+}
+
+// dispatches on cmd[0] and arity, TAG_ERR for anything unrecognised
+static void do_request(vector<string>& cmd, vector<uint8_t>& out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
     }
@@ -225,17 +286,35 @@ static void do_request(vector<string>& cmd, Response& out) {
     else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
     }
+    else if (cmd.size() == 1 && cmd[0] == "keys") {
+        return do_keys(cmd, out);
+    }
     else {
-        out.status = RES_ERR;
+        return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
 }
 
-// serialises resp as len, status, payload onto the outgoing buffer
-static void make_response(const Response& resp, vector<uint8_t>& out) {
-    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
-    buf_append(out, (const uint8_t*)&resp_len, 4);
-    buf_append(out, (const uint8_t*)&resp.status, 4);
-    buf_append(out, resp.data.data(), resp.data.size());
+// reserves a 4 byte length slot and remembers where it sits
+// payload gets written straight after, length backfilled once its known
+static void response_begin(vector<uint8_t>& out, size_t& header) {
+    header = out.size();
+    buf_append_u32(out, 0);   // placeholder, real length filled by response_end
+}
+
+static size_t response_size(vector<uint8_t>& out, size_t header) {
+    return out.size() - header - 4;
+}
+
+// backfills the length prefix, or swaps an oversized reply for an error
+static void response_end(vector<uint8_t>& out, size_t header) {
+    size_t msg_size = response_size(out, header);
+    if (msg_size > k_max_msg) {
+        out.resize(header + 4);                 // drop the half written payload
+        out_err(out, ERR_TOO_BIG, "response is too big.");
+        msg_size = response_size(out, header);
+    }
+    uint32_t len = (uint32_t)msg_size;
+    memcpy(&out[header], &len, 4);
 }
 
 // handles one complete request if the buffer holds one, true means try again
@@ -261,9 +340,11 @@ static bool try_one_request(Conn* conn) {
         return false;
     }
 
-    Response resp;
-    do_request(cmd, resp);
-    make_response(resp, conn->outgoing);
+    // generate the reply in place, wrapped in its length prefix
+    size_t header = 0;
+    response_begin(conn->outgoing, header);
+    do_request(cmd, conn->outgoing);
+    response_end(conn->outgoing, header);
 
     buf_consume(conn->incoming, 4 + len);
     return true;
