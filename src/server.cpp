@@ -12,10 +12,13 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 
+#include <math.h>
+
 #include <string>
 #include <vector>
 
 #include "hashtable.h"
+#include "zset.h"
 
 using namespace std;
 
@@ -142,6 +145,8 @@ enum {
 enum {
     ERR_UNKNOWN = 1,   // command not recognised
     ERR_TOO_BIG = 2,   // reply outgrew k_max_msg
+    ERR_BAD_TYP = 3,   // command used on a key of the wrong type
+    ERR_BAD_ARG = 4,   // argument failed to parse as a number
 };
 
 // fixed width appenders, little endian to match the reader on the other side
@@ -187,16 +192,44 @@ static void out_arr(vector<uint8_t>& out, uint32_t n) {
     buf_append_u32(out, n);
 }
 
+// for arrays whose length is unknown until the elements are produced
+// writes a zero count placeholder and returns where to backfill it later
+static size_t out_begin_arr(vector<uint8_t>& out) {
+    buf_append_u8(out, TAG_ARR);
+    buf_append_u32(out, 0);
+    return out.size() - 4;
+}
+// overwrites the placeholder once the real element count is known
+static void out_end_arr(vector<uint8_t>& out, size_t ctx, uint32_t n) {
+    memcpy(&out[ctx], &n, 4);
+}
+
 
 static struct {
     HMap db;
 } g_data;
 
+// a key can hold one of two value kinds tracked by type
+enum {
+    T_STR = 0,    // plain string in val
+    T_ZSET = 1,   // sorted set in zset
+};
+
 struct Entry {
     struct HNode node; // embedded hashtable node
     string key;
-    string val;
+    uint32_t type = T_STR;
+    string val;        // used when type is t_str
+    ZSet zset;         // used when type is t_zset
 };
+
+// frees a value and its owning entry a zset must drain its members first
+static void entry_del(Entry* ent) {
+    if (ent->type == T_ZSET) {
+        zset_clear(&ent->zset);
+    }
+    delete ent;
+}
 
 // key comparison injected into the table, which only knows HNode
 static bool entry_eq(HNode* lhs, HNode* rhs) {
@@ -223,8 +256,9 @@ static void do_get(vector<string>& cmd, vector<uint8_t>& out) {
     HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (!node) return out_nil(out);
 
-    const string& val = container_of(node, Entry, node)->val;
-    return out_str(out, val.data(), val.size());
+    Entry* ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string");
+    return out_str(out, ent->val.data(), ent->val.size());
 }
 
 // overwrites cmd[1] in place if present, otherwise heap allocates and inserts
@@ -236,12 +270,15 @@ static void do_set(vector<string>& cmd, vector<uint8_t>& out) {
 
     HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        container_of(node, Entry, node)->val.swap(cmd[2]);
+        Entry* ent = container_of(node, Entry, node);
+        if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string");
+        ent->val.swap(cmd[2]);
     }
     else {
         Entry* ent = new Entry();
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
+        ent->type = T_STR;
         ent->val.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
@@ -257,7 +294,7 @@ static void do_del(vector<string>& cmd, vector<uint8_t>& out) {
 
     HNode* node = hm_delete(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        delete container_of(node, Entry, node);
+        entry_del(container_of(node, Entry, node));
     }
     return out_int(out, node ? 1 : 0);
 }
@@ -275,6 +312,116 @@ static void do_keys(vector<string>&, vector<uint8_t>& out) {
     hm_foreach(&g_data.db, &cb_keys, (void*)&out);
 }
 
+// parse a whole string as a double false if any trailing junk or nan
+static bool str2dbl(const string& s, double& out) {
+    char* endp = nullptr;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+// parse a whole string as a base 10 int64 false if any trailing junk
+static bool str2int(const string& s, int64_t& out) {
+    char* endp = nullptr;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+// look up a key expected to hold a zset
+// a missing key reads as the shared empty set so queries just return nothing
+// a wrong type key returns null so the caller can raise an error
+static ZSet k_empty_zset;
+static ZSet* expect_zset(string& key_str) {
+    Entry key;
+    key.key.swap(key_str);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+    HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) return &k_empty_zset;
+    Entry* ent = container_of(node, Entry, node);
+    return ent->type == T_ZSET ? &ent->zset : nullptr;
+}
+
+// zadd key score name adds or moves a member replies 1 when newly added
+static void do_zadd(vector<string>& cmd, vector<uint8_t>& out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) return out_err(out, ERR_BAD_ARG, "expect a number");
+
+    // find the zset for the key or make a fresh one
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+    HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry* ent = nullptr;
+    if (!node) {
+        ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->type = T_ZSET;
+        hm_insert(&g_data.db, &ent->node);
+    }
+    else {
+        ent = container_of(node, Entry, node);
+        if (ent->type != T_ZSET) return out_err(out, ERR_BAD_TYP, "not a zset");
+    }
+
+    const string& name = cmd[3];
+    bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+    return out_int(out, added ? 1 : 0);
+}
+
+// zrem key name removes a member replies 1 when it existed
+static void do_zrem(vector<string>& cmd, vector<uint8_t>& out) {
+    ZSet* zset = expect_zset(cmd[1]);
+    if (!zset) return out_err(out, ERR_BAD_TYP, "not a zset");
+
+    const string& name = cmd[2];
+    ZNode* node = zset_lookup(zset, name.data(), name.size());
+    if (node) zset_delete(zset, node);
+    return out_int(out, node ? 1 : 0);
+}
+
+// zscore key name replies the score as a double or nil when absent
+static void do_zscore(vector<string>& cmd, vector<uint8_t>& out) {
+    ZSet* zset = expect_zset(cmd[1]);
+    if (!zset) return out_err(out, ERR_BAD_TYP, "not a zset");
+
+    const string& name = cmd[2];
+    ZNode* node = zset_lookup(zset, name.data(), name.size());
+    if (!node) return out_nil(out);
+    return out_dbl(out, node->score);
+}
+
+// zquery key score name offset limit
+// seeks to the pair score name skips offset members then emits up to limit of
+// them as a flat array of name score name score in ascending order
+static void do_zquery(vector<string>& cmd, vector<uint8_t>& out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) return out_err(out, ERR_BAD_ARG, "expect a number");
+    const string& name = cmd[3];
+    int64_t offset = 0;
+    int64_t limit = 0;
+    if (!str2int(cmd[4], offset)) return out_err(out, ERR_BAD_ARG, "expect an int");
+    if (!str2int(cmd[5], limit)) return out_err(out, ERR_BAD_ARG, "expect an int");
+
+    ZSet* zset = expect_zset(cmd[1]);
+    if (!zset) return out_err(out, ERR_BAD_TYP, "not a zset");
+
+    if (limit <= 0) return out_arr(out, 0);
+
+    ZNode* znode = zset_seekge(zset, score, name.data(), name.size());
+    znode = znode_offset(znode, offset);
+
+    size_t ctx = out_begin_arr(out);
+    uint32_t n = 0;                       // members emitted so far
+    while (znode && (int64_t)n < limit) {
+        out_str(out, znode->name, znode->len);
+        out_dbl(out, znode->score);
+        znode = znode_offset(znode, +1);
+        n++;
+    }
+    out_end_arr(out, ctx, n * 2);         // two array slots per member
+}
+
 // dispatches on cmd[0] and arity, TAG_ERR for anything unrecognised
 static void do_request(vector<string>& cmd, vector<uint8_t>& out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
@@ -288,6 +435,18 @@ static void do_request(vector<string>& cmd, vector<uint8_t>& out) {
     }
     else if (cmd.size() == 1 && cmd[0] == "keys") {
         return do_keys(cmd, out);
+    }
+    else if (cmd.size() == 4 && cmd[0] == "zadd") {
+        return do_zadd(cmd, out);
+    }
+    else if (cmd.size() == 3 && cmd[0] == "zrem") {
+        return do_zrem(cmd, out);
+    }
+    else if (cmd.size() == 3 && cmd[0] == "zscore") {
+        return do_zscore(cmd, out);
+    }
+    else if (cmd.size() == 6 && cmd[0] == "zquery") {
+        return do_zquery(cmd, out);
     }
     else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
