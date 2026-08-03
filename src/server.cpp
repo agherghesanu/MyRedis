@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -19,6 +20,8 @@
 
 #include "hashtable.h"
 #include "zset.h"
+#include "dlist.h"
+#include "heap.h"
 
 using namespace std;
 
@@ -57,7 +60,19 @@ static void fd_set_nb(int fd) {
 
 const size_t k_max_msg = 32 << 20;
 
+// close a connection once it has sat idle this long in milliseconds
+// overridable at startup with the redis_idle_timeout_ms env var mainly for tests
+static uint64_t g_idle_timeout_ms = 5 * 1000;
+
+// milliseconds from a steady clock unaffected by wall clock changes
+static uint64_t get_monotonic_msec() {
+    struct timespec tv = { 0, 0 };
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000 / 1000;
+}
+
 // per client state, buffers persist across poll wakeups since tcp is a byte stream
+// last_active_ms and idle_node let the loop find and reap idle connections
 struct Conn {
     int fd = -1;
     bool want_read = false;
@@ -65,6 +80,8 @@ struct Conn {
     bool want_close = false;
     vector<uint8_t> incoming;
     vector<uint8_t> outgoing;
+    uint64_t last_active_ms = 0;
+    DList idle_node;
 };
 
 // appends len bytes to the back of buf
@@ -92,6 +109,8 @@ static Conn* handle_accept(int fd) {
     Conn* conn = new Conn();
     conn->fd = connfd;
     conn->want_read = true;
+    conn->last_active_ms = get_monotonic_msec();
+    dlist_init(&conn->idle_node);
     return conn;
 }
 
@@ -205,8 +224,15 @@ static void out_end_arr(vector<uint8_t>& out, size_t ctx, uint32_t n) {
 }
 
 
+// all long lived server state in one place
+// fd2conn maps a socket fd straight to its connection
+// idle_list threads every connection ordered by last activity oldest at the front
+// heap holds the ttl deadlines a min heap so the soonest expiry is at the top
 static struct {
     HMap db;
+    vector<Conn*> fd2conn;
+    DList idle_list;
+    vector<HeapItem> heap;
 } g_data;
 
 // a key can hold one of two value kinds tracked by type
@@ -221,13 +247,52 @@ struct Entry {
     uint32_t type = T_STR;
     string val;        // used when type is t_str
     ZSet zset;         // used when type is t_zset
+    size_t heap_idx = -1;   // slot in g_data.heap or -1 when the key has no ttl
 };
 
+// remove the slot at pos by moving the last item into it then re fixing
+static void heap_delete(vector<HeapItem>& a, size_t pos) {
+    a[pos] = a.back();
+    a.pop_back();
+    if (pos < a.size()) {
+        *a[pos].ref = pos;
+        heap_update(a.data(), pos, a.size());
+    }
+}
+
+// overwrite an existing slot or append a new one then re fix the heap
+static void heap_upsert(vector<HeapItem>& a, size_t pos, HeapItem t) {
+    if (pos < a.size()) {
+        a[pos] = t;
+    }
+    else {
+        pos = a.size();
+        a.push_back(t);
+    }
+    *a[pos].ref = pos;
+    heap_update(a.data(), pos, a.size());
+}
+
+// set or clear a keys expiry a negative ttl means drop any pending expiry
+static void entry_set_ttl(Entry* ent, int64_t ttl_ms) {
+    if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {
+        heap_delete(g_data.heap, ent->heap_idx);
+        ent->heap_idx = -1;
+    }
+    else if (ttl_ms >= 0) {
+        uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
+        HeapItem item = { expire_at, &ent->heap_idx };
+        heap_upsert(g_data.heap, ent->heap_idx, item);
+    }
+}
+
 // frees a value and its owning entry a zset must drain its members first
+// any pending ttl is cancelled so the heap keeps no dangling ref
 static void entry_del(Entry* ent) {
     if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
     }
+    entry_set_ttl(ent, -1);
     delete ent;
 }
 
@@ -422,6 +487,40 @@ static void do_zquery(vector<string>& cmd, vector<uint8_t>& out) {
     out_end_arr(out, ctx, n * 2);         // two array slots per member
 }
 
+// pexpire key ttl_ms, arms or reschedules a keys expiry
+// replies 1 when the key exists 0 when there is nothing to expire
+static void do_expire(vector<string>& cmd, vector<uint8_t>& out) {
+    int64_t ttl_ms = 0;
+    if (!str2int(cmd[2], ttl_ms)) return out_err(out, ERR_BAD_ARG, "expect an int");
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+    HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        Entry* ent = container_of(node, Entry, node);
+        entry_set_ttl(ent, ttl_ms);
+    }
+    return out_int(out, node ? 1 : 0);
+}
+
+// pttl key, milliseconds left before expiry
+// replies -2 when the key is gone -1 when it has no expiry set
+static void do_ttl(vector<string>& cmd, vector<uint8_t>& out) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+    HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) return out_int(out, -2);
+
+    Entry* ent = container_of(node, Entry, node);
+    if (ent->heap_idx == (size_t)-1) return out_int(out, -1);
+
+    uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+    uint64_t now_ms = get_monotonic_msec();
+    return out_int(out, expire_at > now_ms ? (int64_t)(expire_at - now_ms) : 0);
+}
+
 // dispatches on cmd[0] and arity, TAG_ERR for anything unrecognised
 static void do_request(vector<string>& cmd, vector<uint8_t>& out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
@@ -447,6 +546,12 @@ static void do_request(vector<string>& cmd, vector<uint8_t>& out) {
     }
     else if (cmd.size() == 6 && cmd[0] == "zquery") {
         return do_zquery(cmd, out);
+    }
+    else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+        return do_expire(cmd, out);
+    }
+    else if (cmd.size() == 2 && cmd[0] == "pttl") {
+        return do_ttl(cmd, out);
     }
     else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
@@ -554,10 +659,71 @@ static void handle_read(Conn* conn) {
     }
 }
 
+// closes a connection and unlinks it from every index that referenced it
+static void conn_destroy(Conn* conn) {
+    (void)close(conn->fd);
+    g_data.fd2conn[conn->fd] = nullptr;
+    dlist_detach(&conn->idle_node);
+    delete conn;
+}
+
+// how long poll should block before the soonest of any pending deadline
+// weighs the oldest idle connection against the nearest key expiry
+// negative means nothing is scheduled so block until a socket wakes us
+static int32_t next_timer_ms() {
+    uint64_t now_ms = get_monotonic_msec();
+    uint64_t next_ms = (uint64_t)-1;
+
+    // the front of the idle list is the least recently active connection
+    if (!dlist_empty(&g_data.idle_list)) {
+        Conn* conn = container_of(g_data.idle_list.next, Conn, idle_node);
+        next_ms = conn->last_active_ms + g_idle_timeout_ms;
+    }
+    // the root of the heap is the earliest key expiry
+    if (!g_data.heap.empty() && g_data.heap[0].val < next_ms) {
+        next_ms = g_data.heap[0].val;
+    }
+
+    if (next_ms == (uint64_t)-1) return -1;  // no timers at all
+    if (next_ms <= now_ms) return 0;         // already overdue fire at once
+    return (int32_t)(next_ms - now_ms);
+}
+
+// number of expired keys evicted per loop so a mass expiry cannot stall io
+const size_t k_max_works = 2000;
+
+// fire both kinds of timer idle connections and expired keys
+static void process_timers() {
+    uint64_t now_ms = get_monotonic_msec();
+
+    // idle connections the list is ordered so stop at the first one still in time
+    while (!dlist_empty(&g_data.idle_list)) {
+        Conn* conn = container_of(g_data.idle_list.next, Conn, idle_node);
+        uint64_t next_ms = conn->last_active_ms + g_idle_timeout_ms;
+        if (next_ms >= now_ms) break;        // the rest are newer not due yet
+        conn_destroy(conn);
+    }
+
+    // expired keys pop the heap top while it is past due bounded per loop
+    size_t nworks = 0;
+    while (!g_data.heap.empty() && g_data.heap[0].val < now_ms) {
+        Entry* ent = container_of(g_data.heap[0].ref, Entry, heap_idx);
+        HNode* node = hm_delete(&g_data.db, &ent->node, &entry_eq);
+        assert(node == &ent->node);
+        entry_del(ent);                      // also lifts the item off the heap
+        if (++nworks >= k_max_works) break;  // yield back to the loop
+    }
+}
+
 // sets up the listener then runs the event loop
 // poll_args is rebuilt each round since per connection interests change
 // fd2conn is indexed directly by fd, which the kernel keeps small and reuses
 int main() {
+    // let a test shorten the idle timeout so it need not wait the full default
+    if (const char* e = getenv("REDIS_IDLE_TIMEOUT_MS")) {
+        g_idle_timeout_ms = strtoull(e, nullptr, 10);
+    }
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) die("socket()");
 
@@ -577,17 +743,15 @@ int main() {
     rv = listen(fd, SOMAXCONN);
     if (rv) die("listen()");
 
-    vector<Conn*> fd2conn;
+    dlist_init(&g_data.idle_list);
     vector<struct pollfd> poll_args;
-
-    
 
     while (true) {
         poll_args.clear();
         struct pollfd pfd = { fd, POLLIN, 0 };
         poll_args.push_back(pfd);   // slot 0 is always the listener
 
-        for (Conn* conn : fd2conn) {
+        for (Conn* conn : g_data.fd2conn) {
             if (!conn) continue;
             struct pollfd pfd = { conn->fd, POLLERR, 0 };
             if (conn->want_read) pfd.events |= POLLIN;
@@ -595,32 +759,43 @@ int main() {
             poll_args.push_back(pfd);
         }
 
-        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+        // block only until the nearest idle deadline so timers fire on time
+        int32_t timeout_ms = next_timer_ms();
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
         if (rv < 0 && errno == EINTR) continue;   // signal, not an error
         if (rv < 0) die("poll");
 
         if (poll_args[0].revents) {
             if (Conn* conn = handle_accept(fd)) {
-                if (fd2conn.size() <= (size_t)conn->fd) {
-                    fd2conn.resize(conn->fd + 1);
+                if (g_data.fd2conn.size() <= (size_t)conn->fd) {
+                    g_data.fd2conn.resize(conn->fd + 1);
                 }
-                assert(!fd2conn[conn->fd]);
-                fd2conn[conn->fd] = conn;
+                assert(!g_data.fd2conn[conn->fd]);
+                g_data.fd2conn[conn->fd] = conn;
+                // newest connection so it goes to the back of the idle list
+                dlist_insert_before(&g_data.idle_list, &conn->idle_node);
             }
         }
 
         for (size_t i = 1; i < poll_args.size(); ++i) {   // skip the listener
             uint32_t ready = poll_args[i].revents;
             if (ready == 0) continue;
-            Conn* conn = fd2conn[poll_args[i].fd];
+            Conn* conn = g_data.fd2conn[poll_args[i].fd];
+
+            // any io counts as activity so refresh the timer and move to the back
+            conn->last_active_ms = get_monotonic_msec();
+            dlist_detach(&conn->idle_node);
+            dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+
             if (ready & POLLIN) handle_read(conn);
             if (ready & POLLOUT) handle_write(conn);
             if ((ready & POLLERR) || conn->want_close) {
-                (void)close(conn->fd);
-                fd2conn[conn->fd] = NULL;
-                delete conn;
+                conn_destroy(conn);
             }
         }
+
+        // fire idle timeouts after servicing the ready sockets
+        process_timers();
     }
     return 0;
 }

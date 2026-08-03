@@ -123,6 +123,30 @@ expect "zscore on a string key"         "(err) 3 not a zset"    zscore strkey an
 expect "zadd non numeric score"         "(err) 4 expect a number"  zadd z notanumber x
 expect "zquery non numeric offset"      "(err) 4 expect an int"    zquery z 0 "" bad 10
 
+# ttl pexpire arms an expiry pttl reads the remaining time
+expect "pttl on missing key -> minus two"  "(int) -2"   pttl ghost
+expect "make a key to expire"              "(nil)"      set liveskey hello
+expect "pttl with no expiry set -> minus one" "(int) -1"  pttl liveskey
+expect "pexpire an existing key -> 1"      "(int) 1"    pexpire liveskey 100000
+expect "pexpire a missing key -> 0"        "(int) 0"    pexpire ghost 100000
+
+# pttl now returns a positive remaining time so grab it dynamically
+ttl_line="$("$CLIENT" pttl liveskey 2>&1)"
+ttl_val="${ttl_line#(int) }"
+if [[ "$ttl_line" == '(int) '* ]] && (( ttl_val > 0 )) && (( ttl_val <= 100000 )); then
+    echo "  ok: pttl returns remaining time $ttl_val ms"; pass=$((pass + 1))
+else
+    echo "  FAIL: pttl remaining got [$ttl_line]"; fail=$((fail + 1))
+fi
+
+expect "pexpire non numeric ttl"        "(err) 4 expect an int"  pexpire liveskey soon
+
+# a very short expiry then a real wait the key must be gone afterwards
+expect "arm a short expiry"             "(int) 1"      pexpire liveskey 200
+sleep 0.5
+expect "key expired after the wait"     "(nil)"        get liveskey
+expect "pttl after expiry -> minus two"  "(int) -2"     pttl liveskey
+
 # error paths
 expect "unknown command"                "(err) 1 unknown command."  bogus x
 expect "get wrong arity (too few)"      "(err) 1 unknown command."  get
