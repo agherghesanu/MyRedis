@@ -9,7 +9,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(redis_server src/server.cpp
     "src/hashtable.h" "src/hashtable.cpp"
     "src/avl.h" "src/avl.cpp"
-    "src/zset.h" "src/zset.cpp")
+    "src/zset.h" "src/zset.cpp"
+    "src/dlist.h"
+    "src/heap.h" "src/heap.cpp")
 
 # Add Client Executable
 add_executable(redis_client src/client.cpp)
@@ -33,9 +35,21 @@ add_executable(test_zset tests/test_zset.cpp
 target_include_directories(test_zset PRIVATE src)
 add_test(NAME zset COMMAND test_zset)
 
+# min heap unit test covering push update pop and the tracked ref index
+add_executable(test_heap tests/test_heap.cpp "src/heap.h" "src/heap.cpp")
+target_include_directories(test_heap PRIVATE src)
+add_test(NAME heap COMMAND test_heap)
+
 # server and client end to end test drives the real binaries over the socket
 add_test(
     NAME integration
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_integration.sh
             $<TARGET_FILE:redis_server> $<TARGET_FILE:redis_client>
+)
+
+# idle connection timeout test uses a short timeout via an env var
+add_test(
+    NAME timer
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_timer.sh
+            $<TARGET_FILE:redis_server>
 )
