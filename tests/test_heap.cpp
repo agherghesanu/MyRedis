@@ -6,8 +6,10 @@
 #include <cstdlib>
 #include "heap.h"
 
+using namespace std;
+
 // checks the min heap property holds at every node
-static void verify_heap(const std::vector<HeapItem>& a) {
+static void verify_heap(const vector<HeapItem>& a) {
     for (size_t i = 1; i < a.size(); i++) {
         size_t parent = (i + 1) / 2 - 1;
         assert(a[parent].val <= a[i].val);        // parent never larger than child
@@ -15,7 +17,7 @@ static void verify_heap(const std::vector<HeapItem>& a) {
 }
 
 // checks every ref points at the slot that actually holds it
-static void verify_refs(const std::vector<HeapItem>& a) {
+static void verify_refs(const vector<HeapItem>& a) {
     for (size_t i = 0; i < a.size(); i++) {
         assert(*a[i].ref == i);
     }
@@ -24,8 +26,8 @@ static void verify_refs(const std::vector<HeapItem>& a) {
 // drive random pushes and value changes then drain in sorted order
 static void test_random(unsigned seed) {
     srand(seed);
-    std::vector<HeapItem> a;
-    std::vector<size_t> slots;                    // stable backing for ref targets
+    vector<HeapItem> a;
+    vector<size_t> slots;                    // stable backing for ref targets
     slots.reserve(4096);
 
     const int N = 1000;
@@ -71,8 +73,8 @@ static void test_random(unsigned seed) {
 
 // a deliberately worst case ascending then descending insert order
 static void test_ordered() {
-    std::vector<HeapItem> a;
-    std::vector<size_t> slots;
+    vector<HeapItem> a;
+    vector<size_t> slots;
     slots.reserve(400);
 
     auto add = [&](uint64_t val) {
