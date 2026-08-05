@@ -22,6 +22,7 @@
 #include "zset.h"
 #include "dlist.h"
 #include "heap.h"
+#include "thread_pool.h"
 
 using namespace std;
 
@@ -228,11 +229,13 @@ static void out_end_arr(vector<uint8_t>& out, size_t ctx, uint32_t n) {
 // fd2conn maps a socket fd straight to its connection
 // idle_list threads every connection ordered by last activity oldest at the front
 // heap holds the ttl deadlines a min heap so the soonest expiry is at the top
+// thread_pool runs slow destructors off the event loop
 static struct {
     HMap db;
     vector<Conn*> fd2conn;
     DList idle_list;
     vector<HeapItem> heap;
+    ThreadPool thread_pool;
 } g_data;
 
 // a key can hold one of two value kinds tracked by type
@@ -286,14 +289,36 @@ static void entry_set_ttl(Entry* ent, int64_t ttl_ms) {
     }
 }
 
-// frees a value and its owning entry a zset must drain its members first
-// any pending ttl is cancelled so the heap keeps no dangling ref
-static void entry_del(Entry* ent) {
+// the actual destructor a zset must drain its members first
+// runs either inline or on a worker thread depending on how big the value is
+static void entry_del_sync(Entry* ent) {
     if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
     }
-    entry_set_ttl(ent, -1);
     delete ent;
+}
+
+// thread pool trampoline since a worker task is just a void pointer
+static void entry_del_func(void* arg) {
+    entry_del_sync((Entry*)arg);
+}
+
+// frees an entry after it has been unlinked from every shared index
+// small values die inline large ones go to a worker so the loop never blocks
+static void entry_del(Entry* ent) {
+    // drop the ttl here in the event loop thread since the heap is not shared
+    entry_set_ttl(ent, -1);
+
+    // freeing a huge sorted set can take a while so offload it
+    // the entry is already unlinked so the worker owns it alone no locking needed
+    size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+    const size_t k_large_container_size = 1000;
+    if (set_size > k_large_container_size) {
+        thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
+    }
+    else {
+        entry_del_sync(ent);   // small enough that a context switch costs more
+    }
 }
 
 // key comparison injected into the table, which only knows HNode
@@ -723,6 +748,9 @@ int main() {
     if (const char* e = getenv("REDIS_IDLE_TIMEOUT_MS")) {
         g_idle_timeout_ms = strtoull(e, nullptr, 10);
     }
+
+    // spin up the workers that free large values off the event loop
+    thread_pool_init(&g_data.thread_pool, 4);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) die("socket()");

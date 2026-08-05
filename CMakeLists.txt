@@ -11,7 +11,16 @@ add_executable(redis_server src/server.cpp
     "src/avl.h" "src/avl.cpp"
     "src/zset.h" "src/zset.cpp"
     "src/dlist.h"
-    "src/heap.h" "src/heap.cpp")
+    "src/heap.h" "src/heap.cpp"
+    "src/thread_pool.h" "src/thread_pool.cpp")
+
+# the thread pool needs pthreads
+find_package(Threads REQUIRED)
+target_link_libraries(redis_server PRIVATE Threads::Threads)
+
+# concurrent load generator many client threads hammering one server
+add_executable(bench bench/bench.cpp)
+target_link_libraries(bench PRIVATE Threads::Threads)
 
 # Add Client Executable
 add_executable(redis_client src/client.cpp)
@@ -40,6 +49,13 @@ add_executable(test_heap tests/test_heap.cpp "src/heap.h" "src/heap.cpp")
 target_include_directories(test_heap PRIVATE src)
 add_test(NAME heap COMMAND test_heap)
 
+# thread pool unit test many tasks must all run exactly once
+add_executable(test_thread_pool tests/test_thread_pool.cpp
+    "src/thread_pool.h" "src/thread_pool.cpp")
+target_include_directories(test_thread_pool PRIVATE src)
+target_link_libraries(test_thread_pool PRIVATE Threads::Threads)
+add_test(NAME thread_pool COMMAND test_thread_pool)
+
 # server and client end to end test drives the real binaries over the socket
 add_test(
     NAME integration
@@ -51,5 +67,12 @@ add_test(
 add_test(
     NAME timer
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_timer.sh
+            $<TARGET_FILE:redis_server>
+)
+
+# async big value deletion test exercises the thread pool path end to end
+add_test(
+    NAME bigdel
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bigdel.sh
             $<TARGET_FILE:redis_server>
 )

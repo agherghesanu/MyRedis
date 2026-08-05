@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
         die("connect");
     }
 
-    std::vector<std::string> cmd;
+    vector<string> cmd;
     for (int i = 1; i < argc; ++i) {
         cmd.push_back(argv[i]);
     }

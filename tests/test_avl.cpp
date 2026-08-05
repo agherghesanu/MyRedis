@@ -5,6 +5,8 @@
 #include <vector>
 #include "avl.h"
 
+using namespace std;
+
 // same container_of trick the server uses to go from node back to payload
 #define container_of(ptr, T, member) \
     ((T *)( (char *)ptr - offsetof(T, member) ))
@@ -83,7 +85,7 @@ static void verify(AVLNode* parent, AVLNode* node) {
 }
 
 // flatten the tree in sorted order for comparison against the shadow set
-static void extract(AVLNode* node, std::vector<uint32_t>& out) {
+static void extract(AVLNode* node, vector<uint32_t>& out) {
     if (!node) return;
     extract(node->left, out);
     out.push_back(container_of(node, Data, node)->val);
@@ -94,17 +96,17 @@ static void extract(AVLNode* node, std::vector<uint32_t>& out) {
 static void test_insert(uint32_t sz) {
     for (uint32_t start = 0; start < sz; start++) {      // rotate the insert order
         Container c;
-        std::multiset<uint32_t> ref;
+        multiset<uint32_t> ref;
         for (uint32_t i = 0; i < sz; i++) {
             uint32_t val = (start + i) % sz;
             add(c, val);
             ref.insert(val);
             verify(nullptr, c.root);
         }
-        std::vector<uint32_t> got;
+        vector<uint32_t> got;
         extract(c.root, got);
         assert(got.size() == ref.size());
-        assert(std::vector<uint32_t>(ref.begin(), ref.end()) == got);  // sorted match
+        assert(vector<uint32_t>(ref.begin(), ref.end()) == got);  // sorted match
 
         // tear down, verifying after each delete too
         while (c.root) {

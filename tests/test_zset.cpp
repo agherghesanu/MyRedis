@@ -7,25 +7,27 @@
 #include <utility>
 #include "zset.h"
 
+using namespace std;
+
 // walk the whole set in sorted order by seeking to the smallest then stepping
-static std::vector<std::pair<double, std::string>> dump(ZSet& z) {
-    std::vector<std::pair<double, std::string>> out;
+static vector<pair<double, string>> dump(ZSet& z) {
+    vector<pair<double, string>> out;
     ZNode* n = zset_seekge(&z, -INFINITY, "", 0);   // first member in order
     while (n) {
-        out.push_back({ n->score, std::string(n->name, n->len) });
+        out.push_back({ n->score, string(n->name, n->len) });
         n = znode_offset(n, +1);
     }
     return out;
 }
 
 // reference ordering is a sorted set of score name pairs
-static std::vector<std::pair<double, std::string>> ref_dump(
-        std::set<std::pair<double, std::string>>& ref) {
+static vector<pair<double, string>> ref_dump(
+        set<pair<double, string>>& ref) {
     return { ref.begin(), ref.end() };
 }
 
-static void add(ZSet& z, std::set<std::pair<double, std::string>>& ref,
-                double score, const std::string& name, bool expect_new) {
+static void add(ZSet& z, set<pair<double, string>>& ref,
+                double score, const string& name, bool expect_new) {
     // erase any old score for this name from the reference first
     for (auto it = ref.begin(); it != ref.end(); ++it) {
         if (it->second == name) { ref.erase(it); break; }
@@ -39,7 +41,7 @@ static void add(ZSet& z, std::set<std::pair<double, std::string>>& ref,
 // insert distinct members and update some checking order the whole way
 static void test_add_update() {
     ZSet z;
-    std::set<std::pair<double, std::string>> ref;
+    set<pair<double, string>> ref;
 
     add(z, ref, 1.0, "a", true);
     add(z, ref, 2.0, "b", true);
@@ -63,7 +65,7 @@ static void test_add_update() {
 static void test_seek() {
     ZSet z;
     for (int i = 0; i < 10; i++) {              // even scores up to 18 names k0 through k9
-        std::string name = "k" + std::to_string(i);
+        string name = "k" + to_string(i);
         zset_insert(&z, name.data(), name.size(), i * 2.0);
     }
 
@@ -87,7 +89,7 @@ static void test_seek() {
 static void test_offset() {
     ZSet z;
     for (int i = 0; i < 6; i++) {               // scores 0 through 5 names a through f
-        std::string name(1, char('a' + i));
+        string name(1, char('a' + i));
         zset_insert(&z, name.data(), name.size(), i);
     }
 
@@ -110,15 +112,15 @@ static void test_offset() {
 // delete removes from both the tree order and the name lookup
 static void test_delete() {
     ZSet z;
-    std::set<std::pair<double, std::string>> ref;
+    set<pair<double, string>> ref;
     for (int i = 0; i < 20; i++) {
-        std::string name = "m" + std::to_string(i);
+        string name = "m" + to_string(i);
         zset_insert(&z, name.data(), name.size(), i);
         ref.insert({ (double)i, name });
     }
 
     for (int i = 0; i < 20; i += 2) {           // delete every even ranked member
-        std::string name = "m" + std::to_string(i);
+        string name = "m" + to_string(i);
         ZNode* node = zset_lookup(&z, name.data(), name.size());
         assert(node);
         zset_delete(&z, node);

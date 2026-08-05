@@ -5,6 +5,8 @@
 #include <set>
 #include "hashtable.h"
 
+using namespace std;
+
 // go from an embedded node back to its owning payload
 #define container_of(ptr, T, member) \
     ((T *)( (char *)ptr - offsetof(T, member) ))
@@ -148,9 +150,9 @@ static void test_foreach() {
     const uint32_t N = 2000;
     for (uint32_t i = 0; i < N; i++) insert(&m, i);
 
-    std::set<uint32_t> seen;
+    set<uint32_t> seen;
     hm_foreach(&m, [](HNode* n, void* arg) {
-        auto* s = (std::set<uint32_t>*)arg;
+        auto* s = (set<uint32_t>*)arg;
         bool inserted = s->insert(container_of(n, Item, node)->key).second;
         assert(inserted);                    // no key visited twice
     }, &seen);
